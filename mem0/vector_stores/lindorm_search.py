@@ -1,4 +1,3 @@
-import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -156,9 +155,6 @@ class LindormSearch(VectorStoreBase):
         if filter_clauses:
             knn_query["knn"]["vector_field"]["filter"] = {"bool": {"must": filter_clauses}}
         query_body["query"] = knn_query
-
-        with open("query.json", "w") as f:
-            f.write(json.dumps(query_body))
 
         # Execute search
         try:
