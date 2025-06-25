@@ -41,6 +41,25 @@ class MemgraphConfig(BaseModel):
         return values
 
 
+class GremlinGraphConfig(BaseModel):
+    url: str = Field(description="Host address for the graph database")
+    username: str = Field(description="Username for the graph database")
+    password: str = Field(description="Password for the graph database")
+    traversal_source: str = Field(description="Traversal source for the graph database", default="g")
+    message_serializer: str = Field(description="Message serializer for the graph database", default=None)
+
+    @model_validator(mode="before")
+    def check_host_port_or_path(cls, values):
+        url, username, password = (
+            values.get("url"),
+            values.get("username"),
+            values.get("password"),
+        )
+        if not url or not username or not password:
+            raise ValueError("Please provide 'url', 'username' and 'password'.")
+        return values
+
+
 class GraphStoreConfig(BaseModel):
     provider: str = Field(description="Provider of the data store (e.g., 'neo4j')", default="neo4j")
     config: Neo4jConfig = Field(description="Configuration for the specific data store", default=None)
