@@ -10,6 +10,7 @@ class LindormSearchConfig(BaseModel):
     user: Optional[str] = Field("root", description="Username for authentication")
     password: Optional[str] = Field(None, description="Password for authentication")
     embedding_model_dims: int = Field(1536, description="Dimension of the embedding vector")
+    distance_method: str = Field("cosinesimil", description="Distance metric for similarity search")
     verify_certs: bool = Field(False, description="Verify SSL certificates (default False for OpenSearch)")
     use_ssl: bool = Field(False, description="Use SSL for connection (default False for OpenSearch)")
     http_auth: Optional[object] = Field(None, description="HTTP authentication method / AWS SigV4")
