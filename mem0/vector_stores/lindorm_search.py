@@ -3,7 +3,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 try:
-    from opensearchpy import OpenSearch, RequestsHttpConnection
+    from opensearchpy import OpenSearch, RequestsHttpConnection, helpers, NotFoundError
 except ImportError:
     raise ImportError("OpenSearch requires extra dependencies. Install with `pip install opensearch-py`") from None
 
@@ -27,9 +27,8 @@ class LindormSearch(VectorStoreBase):
 
         # Initialize OpenSearch client
         self.client = OpenSearch(
-            hosts=[{"host": config.host, "port": config.port or 9200}],
-            http_auth=config.http_auth
-            if config.http_auth
+            hosts=[{"host": config.host, "port": config.port}],
+            http_auth=config.http_auth if config.http_auth
             else ((config.user, config.password) if (config.user and config.password) else None),
             use_ssl=config.use_ssl,
             verify_certs=config.verify_certs,
@@ -41,92 +40,87 @@ class LindormSearch(VectorStoreBase):
         self.embedding_model_dims = config.embedding_model_dims
         self.create_col(self.collection_name, self.embedding_model_dims)
 
-    def create_index(self) -> None:
-        """Create OpenSearch index with proper mappings if it doesn't exist."""
+    def create_col(self, name: str, vector_size: int, distance: str) -> None:
+        """Create a new collection (index in OpenSearch)."""
+        if distance not in ["cosinesimil", "l2", "innerproduct"]:
+            distance = "cosinesimil"
         index_settings = {
             "settings": {
-                "index": {"number_of_replicas": 1, "number_of_shards": 5, "refresh_interval": "10s", "knn": True}
+                "index.knn": True,
+                "knn_routing": True,
             },
             "mappings": {
-                "properties": {
-                    "text": {"type": "text"},
-                    "vector_field": {
-                        "type": "knn_vector",
-                        "dimension": self.embedding_model_dims,
-                        "method": {"engine": "lvector", "name": "hnsw", "space_type": "cosinesimil"},
-                    },
-                    "metadata": {"type": "object", "properties": {"user_id": {"type": "keyword"}}},
-                }
-            },
-        }
-
-        if not self.client.indices.exists(index=self.collection_name):
-            self.client.indices.create(index=self.collection_name, body=index_settings)
-            logger.info(f"Created index {self.collection_name}")
-        else:
-            logger.info(f"Index {self.collection_name} already exists")
-
-    def create_col(self, name: str, vector_size: int) -> None:
-        """Create a new collection (index in OpenSearch)."""
-        index_settings = {
-            "settings": {"index.knn": True},
-            "mappings": {
+                "_source": {
+                    "excludes": ["vector_field"]
+                },
                 "properties": {
                     "vector_field": {
                         "type": "knn_vector",
                         "dimension": vector_size,
-                        "method": {"engine": "lvector", "name": "hnsw", "space_type": "cosinesimil"},
+                        "method": {
+                            "engine": "lvector",
+                            "name": "flat",
+                            "space_type": distance
+                        },
                     },
-                    "payload": {"type": "object"},
-                    "id": {"type": "keyword"},
+                    "payload": {"type": "object"}
                 }
             },
         }
 
-        if not self.client.indices.exists(index=name):
-            logger.warning(f"Creating index {name}, it might take 1-2 minutes...")
-            self.client.indices.create(index=name, body=index_settings)
-
-            # Wait for index to be ready
-            max_retries = 180 # 3 minutes timeout
-            retry_count = 0
-            while retry_count < max_retries:
+        def _wait_for_index_ready(collection: str, max_retries: int = 180, retry_interval: float = 0.5) -> None:
+            for _ in range(max_retries):
                 try:
-                    # Check if index is ready by attempting a simple search
-                    self.client.search(index=name, body={"query": {"match_all": {}}})
-                    time.sleep(1)
-                    logger.info(f"Index {name} is ready")
+                    self.client.search(index=collection, body={"query": {"match_all": {}}})
+                    logger.info(f"Index {collection} is ready")
                     return
                 except Exception:
-                    retry_count += 1
-                    if retry_count == max_retries:
-                        raise TimeoutError(f"Index {name} creation timed out after {max_retries} seconds")
-                    time.sleep(0.5)
+                    time.sleep(retry_interval)
+            raise TimeoutError(f"Index {collection} creation timed out after {max_retries * retry_interval} seconds")
+
+        try:
+            logger.info(f"Creating index {name}...")
+            self.client.indices.create(index=name, body=index_settings)
+            _wait_for_index_ready(name)
+        except Exception as e:
+            logger.error(f"Failed to create index {name}: {str(e)}")
+            raise
 
     def insert(
-        self, vectors: List[List[float]], payloads: Optional[List[Dict]] = None, ids: Optional[List[str]] = None
-    ) -> List[OutputData]:
-        """Insert vectors into the index."""
+            self, vectors: List[List[float]], payloads: Optional[List[Dict]] = None, ids: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """Insert vectors into the index using bulk API."""
         if not ids:
             ids = [str(i) for i in range(len(vectors))]
 
         if payloads is None:
             payloads = [{} for _ in range(len(vectors))]
 
-        for i, (vec, id_) in enumerate(zip(vectors, ids)):
-            body = {
-                "vector_field": vec,
-                "payload": payloads[i],
-                "id": id_,
+        actions = []
+        for vec, payload, id_ in zip(vectors, payloads, ids):
+            action = {
+                "_op_type": "index",
+                "_index": self.collection_name,
+                "_routing": payload.get("user_id", "general"),
+                "_id": id_,
+                "_source": {
+                    "vector_field": vec,
+                    "payload": payload
+                }
             }
-            self.client.index(index=self.collection_name, body=body)
-
-        results = []
-
-        return results
+            actions.append(action)
+        try:
+            success, failed = helpers.bulk(self.client, actions, stats_only=True)
+            results = [{"id": id_, "status": "success"} for id_ in ids[:success]]
+            if failed:
+                results.extend([{"id": id_, "status": "failed"} for id_ in ids[success:]])
+            return results
+        except Exception as e:
+            logger.error(f"Bulk insert failed: {str(e)}")
+            raise
 
     def search(
-        self, query: str, vectors: List[float], limit: int = 5, filters: Optional[Dict] = None
+            self, query: str, vectors: List[float], limit: int = 5, filters: Optional[Dict] = None
     ) -> List[OutputData]:
         """Search for similar vectors using OpenSearch k-NN search with optional filters."""
         # Base KNN query
@@ -134,100 +128,89 @@ class LindormSearch(VectorStoreBase):
             "knn": {
                 "vector_field": {
                     "vector": vectors,
-                    "k": limit * 2,
+                    "k": limit,
                 }
             }
         }
+        query_body = {"size": limit, "query": None, "_source": {"excludes": ["vector_field"]}}
 
-        # Start building the full query
-        query_body = {"size": limit * 2, "query": None, "_source": {"excludes": ["vector_field"]}}
-        # Prepare filter conditions if applicable
         filter_clauses = []
         if filters:
             for key in ["user_id", "run_id", "agent_id"]:
                 value = filters.get(key)
                 if value:
-                    filter_clauses.append({"term": {f"payload.{key}.keyword": value}})
+                    if isinstance(value, list):
+                        filter_clauses.append({"terms": {f"payload.{key}.keyword": value}})
+                    else:
+                        filter_clauses.append({"term": {f"payload.{key}.keyword": value}})
         if query is not None and query != "":
             filter_clauses.append({"match": {"payload.data": query}})
-
         # Combine knn with filters if needed
         if filter_clauses:
             knn_query["knn"]["vector_field"]["filter"] = {"bool": {"must": filter_clauses}}
         query_body["query"] = knn_query
 
         # Execute search
-        response = self.client.search(index=self.collection_name, body=query_body)
-        hits = response["hits"]["hits"]
-        results = [
-            OutputData(id=hit["_source"].get("id"), score=hit["_score"], payload=hit["_source"].get("payload", {}))
-            for hit in hits
-        ]
-        return results
+        try:
+            routing = filters.get("user_id", "general") if filters else "general"
+            response = self.client.search(index=self.collection_name, body=query_body, routing=routing)
+            return [
+                OutputData(id=hit["_id"], score=hit["_score"], payload=hit["_source"].get("payload", {}))
+                for hit in response["hits"]["hits"]
+            ]
+        except Exception as e:
+            logger.error(f"Search failed: {str(e)}")
+            return []
 
     def delete(self, vector_id: str) -> None:
         """Delete a vector by custom ID."""
-        # First, find the document by custom ID
-        search_query = {"query": {"term": {"id": vector_id}}}
-
-        response = self.client.search(index=self.collection_name, body=search_query)
-        hits = response.get("hits", {}).get("hits", [])
-
-        if not hits:
-            return
-
-        opensearch_id = hits[0]["_id"]
-
         # Delete using the actual document ID
-        self.client.delete(index=self.collection_name, id=opensearch_id)
+        self.client.delete(index=self.collection_name, id=vector_id)
 
     def update(self, vector_id: str, vector: Optional[List[float]] = None, payload: Optional[Dict] = None) -> None:
-        """Update a vector and its payload using the custom 'id' field."""
-
-        # First, find the document by custom ID
-        search_query = {"query": {"term": {"id": vector_id}}}
-
-        response = self.client.search(index=self.collection_name, body=search_query)
-        hits = response.get("hits", {}).get("hits", [])
-
-        if not hits:
-            return
-
-        opensearch_id = hits[0]["_id"]  # The actual document ID in OpenSearch
-
-        # Prepare updated fields
+        """Update a vector and its payload using the vector_id directly."""
         doc = {}
         if vector is not None:
             doc["vector_field"] = vector
         if payload is not None:
             doc["payload"] = payload
 
-        if doc:
-            try:
-                response = self.client.update(index=self.collection_name, id=opensearch_id, body={"doc": doc})
-            except Exception:
-                pass
+        if not doc:
+            return None
+        try:
+            response = self.client.update(
+                index=self.collection_name,
+                id=vector_id,
+                body={"doc": doc},
+                retry_on_conflict=3
+            )
+            return
+        except NotFoundError:
+            raise
 
     def get(self, vector_id: str) -> Optional[OutputData]:
         """Retrieve a vector by ID."""
         try:
-            # First check if index exists
+            # Check if index exists
             if not self.client.indices.exists(index=self.collection_name):
-                logger.info(f"Index {self.collection_name} does not exist, creating it...")
-                self.create_col(self.collection_name, self.embedding_model_dims)
+                logger.info(f"Index {self.collection_name} does not exist.")
                 return None
 
-            search_query = {"query": {"term": {"id": vector_id}}}
-            response = self.client.search(index=self.collection_name, body=search_query)
+            # Directly get the document by ID
+            response = self.client.get(index=self.collection_name, id=vector_id)
 
-            hits = response["hits"]["hits"]
+            source = response['_source']
+            return OutputData(
+                id=vector_id,
+                score=1.0,
+                payload=source.get('payload', {})
+            )
 
-            if not hits:
-                return None
-
-            return OutputData(id=hits[0]["_source"].get("id"), score=1.0, payload=hits[0]["_source"].get("payload", {}))
+        except NotFoundError:
+            logger.info(f"Vector with ID {vector_id} not found in index {self.collection_name}.")
+            return None
         except Exception as e:
-            logger.error(f"Error retrieving vector {vector_id}: {str(e)}")
+            logger.error(f"Error retrieving vector {vector_id} from index {self.collection_name}: {str(e)}")
             return None
 
     def list_cols(self) -> List[str]:
@@ -238,39 +221,57 @@ class LindormSearch(VectorStoreBase):
         """Delete a collection (index)."""
         self.client.indices.delete(index=self.collection_name)
 
-    def col_info(self, name: str) -> Any:
+    def col_info(self) -> Any:
         """Get information about a collection (index)."""
-        return self.client.indices.get(index=name)
+        return self.client.indices.get(index=self.collection_name)
 
     def list(self, filters: Optional[Dict] = None, limit: Optional[int] = None) -> List[OutputData]:
+        """
+        List all memories with optional filters.
+
+        :param filters: Optional dictionary of filters
+        :param limit: Optional limit on the number of results
+        :return: List of OutputData objects
+        """
         try:
-            """List all memories with optional filters."""
-            query: Dict = {"query": {"match_all": {}}, "_source": {"excludes": ["vector_field"]}}
-
-            filter_clauses = []
-            if filters:
-                for key in ["user_id", "run_id", "agent_id"]:
-                    value = filters.get(key)
-                    if value:
-                        filter_clauses.append({"term": {f"payload.{key}.keyword": value}})
-
-            if filter_clauses:
-                query["query"] = {"bool": {"filter": filter_clauses}}
+            query = self._build_list_query(filters)
+            body = {
+                "query": query,
+                "_source": {"excludes": ["vector_field"]},
+                "sort": [{"_score": {"order": "desc"}}]
+            }
 
             if limit:
-                query["size"] = limit
+                body["size"] = limit
 
-            response = self.client.search(index=self.collection_name, body=query)
+            response = self.client.search(index=self.collection_name, body=body)
             hits = response["hits"]["hits"]
 
             return [
-                [
-                    OutputData(id=hit["_source"].get("id"), score=1.0, payload=hit["_source"].get("payload", {}))
-                    for hit in hits
-                ]
+                OutputData(
+                    id=hit["_id"],
+                    score=hit["_score"],
+                    payload=hit["_source"].get("payload", {})
+                )
+                for hit in hits
             ]
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error in list operation: {str(e)}")
             return []
+
+    def _build_list_query(self, filters: Optional[Dict]) -> Dict:
+        """Build the query for list operation based on filters."""
+        if not filters:
+            return {"match_all": {}}
+
+        must_clauses = []
+        for key, value in filters.items():
+            if key in ["user_id", "run_id", "agent_id"]:
+                if isinstance(value, list):
+                    must_clauses.append({"terms": {f"payload.{key}.keyword": value}})
+                else:
+                    must_clauses.append({"term": {f"payload.{key}.keyword": value}})
+        return {"bool": {"must": must_clauses}} if must_clauses else {"match_all": {}}
 
     def reset(self):
         """Reset the index by deleting and recreating it."""
