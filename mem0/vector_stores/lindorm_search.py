@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -34,11 +35,14 @@ class LindormSearch(VectorStoreBase):
             verify_certs=config.verify_certs,
             connection_class=RequestsHttpConnection,
             pool_maxsize=20,
+            timeout=30,
+            retry_on_timeout=True,
+            max_retries=3,
         )
 
         self.collection_name = config.collection_name
         self.embedding_model_dims = config.embedding_model_dims
-        self.create_col(self.collection_name, self.embedding_model_dims)
+        self.create_col(self.collection_name, self.embedding_model_dims, config.distance_method)
 
     def create_col(self, name: str, vector_size: int, distance: str) -> None:
         """Create a new collection (index in OpenSearch)."""
@@ -67,6 +71,9 @@ class LindormSearch(VectorStoreBase):
                 }
             },
         }
+        if self.client.indices.exists(index=name):
+            logger.info(f"Index {name} already exists")
+            return
 
         def _wait_for_index_ready(collection: str, max_retries: int = 180, retry_interval: float = 0.5) -> None:
             for _ in range(max_retries):
@@ -150,6 +157,9 @@ class LindormSearch(VectorStoreBase):
             knn_query["knn"]["vector_field"]["filter"] = {"bool": {"must": filter_clauses}}
         query_body["query"] = knn_query
 
+        with open("query.json", "w") as f:
+            f.write(json.dumps(query_body))
+
         # Execute search
         try:
             routing = filters.get("user_id", "general") if filters else "general"
@@ -165,7 +175,11 @@ class LindormSearch(VectorStoreBase):
     def delete(self, vector_id: str) -> None:
         """Delete a vector by custom ID."""
         # Delete using the actual document ID
-        self.client.delete(index=self.collection_name, id=vector_id)
+        record = self.get(vector_id)
+        if record is None:
+            return
+        routing = record.payload.get("user_id", "general")
+        self.client.delete(index=self.collection_name, id=vector_id, routing=routing)
 
     def update(self, vector_id: str, vector: Optional[List[float]] = None, payload: Optional[Dict] = None) -> None:
         """Update a vector and its payload using the vector_id directly."""
@@ -278,3 +292,12 @@ class LindormSearch(VectorStoreBase):
         logger.warning(f"Resetting index {self.collection_name}...")
         self.delete_col()
         self.create_col(self.collection_name, self.embedding_model_dims)
+
+    def refresh(self):
+        """Refresh the index to make recent operations visible for search."""
+        try:
+            self.client.indices.refresh(index=self.collection_name)
+            logger.info(f"Index {self.collection_name} refreshed successfully.")
+        except Exception as e:
+            logger.error(f"Failed to refresh index {self.collection_name}: {str(e)}")
+            raise
