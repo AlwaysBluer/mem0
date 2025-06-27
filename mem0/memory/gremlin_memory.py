@@ -386,32 +386,6 @@ class MemoryGraph:
             destination = item["destination"]
             relationship = item["relationship"]
 
-            query = (
-                f"g.V().hasLabel(node_label)"
-                f".has('name', source_name)"
-                f".has('user_id', user_id)"
-            )
-
-            if agent_id:
-                query += f".has('agent_id', agent_id)"
-
-            query += (
-                f".outE(relationship)"
-                f".where(inV().has('name', dest_name)"
-                f".has('user_id', user_id)"
-            )
-
-            if agent_id:
-                query += f".has('agent_id', agent_id)"
-
-            query += (
-                f")"
-                f".project('source', 'target', 'relationship')"
-                f".by(outV().values('name'))"
-                f".by(inV().values('name'))"
-                f".by(label())"
-            )
-
             params = {
                 'node_label': self.node_label,
                 'source_name': source,
@@ -422,40 +396,61 @@ class MemoryGraph:
             if agent_id:
                 params['agent_id'] = agent_id
 
-            result = self.graph.submit(query, params).all().result()
-            results.extend(result)
-
-            delete_edge_query = (
+            check_relation_query = (
                 f"g.V().hasLabel(node_label)"
                 f".has('name', source_name)"
                 f".has('user_id', user_id)"
             )
             if agent_id:
-                delete_edge_query += f".has('agent_id', agent_id)"
-            delete_edge_query += (
+                check_relation_query += f".has('agent_id', agent_id)"
+            check_relation_query += (
                 f".outE(relationship)"
                 f".where(inV().has('name', dest_name)"
                 f".has('user_id', user_id)"
             )
             if agent_id:
-                delete_edge_query += f".has('agent_id', agent_id)"
-            delete_edge_query += f").drop()"
-
-            self.graph.submit(delete_edge_query, params)
-
-            delete_orphan_query = (
-                f"g.V().has('name', source_name).has('user_id', user_id).choose("
-                f"__.not(bothE()),"
-                f"__.drop(),"
-                f"__.property('mentions', __.values('mentions').math('_ - 1')));"
-
-                f"g.V().has('name', dest_name).has('user_id', user_id).choose("
-                f"__.not(bothE()),"
-                f"__.drop(),"
-                f"__.property('mentions', __.values('mentions').math('_ - 1')))"
+                check_relation_query += f".has('agent_id', agent_id)"
+            check_relation_query += (
+                f")"
+                f".project('source', 'target', 'relationship')"
+                f".by(outV().values('name'))"
+                f".by(inV().values('name'))"
+                f".by(label())"
             )
-            self.graph.submit(delete_orphan_query, params)
 
+            result = self.graph.submit(check_relation_query, params).all().result()
+
+            # only when you find it that you can delete the edge and vertex.
+            if result:
+                results.extend(result)
+                delete_edge_query = (
+                    f"g.V().hasLabel(node_label)"
+                    f".has('name', source_name)"
+                    f".has('user_id', user_id)"
+                )
+                if agent_id:
+                    delete_edge_query += f".has('agent_id', agent_id)"
+                delete_edge_query += (
+                    f".outE(relationship)"
+                    f".where(inV().has('name', dest_name)"
+                    f".has('user_id', user_id)"
+                )
+                if agent_id:
+                    delete_edge_query += f".has('agent_id', agent_id)"
+                delete_edge_query += f").drop()"
+                self.graph.submit(delete_edge_query, params)
+                delete_orphan_query = (
+                    f"g.V().has('name', source_name).has('user_id', user_id).choose("
+                    f"__.not(bothE()),"
+                    f"__.drop(),"
+                    f"__.property('mentions', __.values('mentions').math('_ - 1')));"
+
+                    f"g.V().has('name', dest_name).has('user_id', user_id).choose("
+                    f"__.not(bothE()),"
+                    f"__.drop(),"
+                    f"__.property('mentions', __.values('mentions').math('_ - 1')))"
+                )
+                self.graph.submit(delete_orphan_query, params)
         return results
 
     def _add_entities(self, to_be_added, filters, entity_type_map):
@@ -549,7 +544,6 @@ class MemoryGraph:
 
     def _search_destination_node(self, destination_embedding, filters, threshold=0.9):
         raise NotImplementedError("embedding searching is not supported in Gremlin.")
-
     def _current_timestamp(self):
         return int(time.time())
 

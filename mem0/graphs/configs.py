@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -47,6 +47,7 @@ class GremlinGraphConfig(BaseModel):
     password: str = Field(description="Password for the graph database")
     traversal_source: str = Field(description="Traversal source for the graph database", default="g")
     message_serializer: str = Field(description="Message serializer for the graph database", default=None)
+    base_label: bool = Field(description="Whether to use base node label __Entity__ for all entities", default=True)
 
     @model_validator(mode="before")
     def check_host_port_or_path(cls, values):
@@ -62,7 +63,7 @@ class GremlinGraphConfig(BaseModel):
 
 class GraphStoreConfig(BaseModel):
     provider: str = Field(description="Provider of the data store (e.g., 'neo4j')", default="neo4j")
-    config: Neo4jConfig = Field(description="Configuration for the specific data store", default=None)
+    config: Any = Field(description="Configuration for the specific data store", default=None)
     llm: Optional[LlmConfig] = Field(description="LLM configuration for querying the graph store", default=None)
     custom_prompt: Optional[str] = Field(
         description="Custom prompt to fetch entities from the given text", default=None

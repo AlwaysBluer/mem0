@@ -138,7 +138,7 @@ class Memory(MemoryBase):
         if self.config.graph_store.config:
             if self.config.graph_store.provider == "memgraph":
                 from mem0.memory.memgraph_memory import MemoryGraph
-            elif self.config.graph_store.provider == "gremlin_graph":
+            elif self.config.graph_store.provider == "gremlin":
                 from mem0.memory.gremlin_memory import MemoryGraph
             else:
                 from mem0.memory.graph_memory import MemoryGraph
