@@ -75,5 +75,7 @@ class GraphStoreConfig(BaseModel):
             return Neo4jConfig(**v.model_dump())
         elif provider == "memgraph":
             return MemgraphConfig(**v.model_dump())
+        elif provider == "gremlin_graph":
+            return GremlinGraphConfig(**v.model_dump())
         else:
             raise ValueError(f"Unsupported graph store provider: {provider}")

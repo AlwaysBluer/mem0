@@ -1,4 +1,6 @@
+import hashlib
 import logging
+import time
 
 from mem0.memory.utils import format_entities
 
@@ -6,6 +8,11 @@ try:
     from gremlin_python.driver import client, serializer
 except ImportError:
     raise ImportError("gremlin_python is not installed. Please install it using `pip install gremlinpython`")
+
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    raise ImportError("rank_bm25 is not installed. Please install it using pip install rank-bm25")
 
 from mem0.graphs.tools import (
     DELETE_MEMORY_STRUCT_TOOL_GRAPH,
@@ -16,53 +23,31 @@ from mem0.graphs.tools import (
     RELATIONS_TOOL,
 )
 from mem0.graphs.utils import EXTRACT_RELATIONS_PROMPT, get_delete_messages
-from mem0.graphs.configs import GremlinGraphConfig
-from mem0.utils.factory import EmbedderFactory, LlmFactory
+from mem0.utils.factory import LlmFactory
 
 logger = logging.getLogger(__name__)
 
 
 class MemoryGraph:
-    def __init__(self, config: GremlinGraphConfig):
+    def __init__(self, config):
         self.config = config
-        self.graph_client = client.Client(
-            url=config.url,
-            traversal_source=config.traversal_source,
-            username=config.username,
-            password=config.password,
-            message_serializer=config.message_serializer if config.message_serializer
-                            else serializer.GraphSONSerializersV2d0(),
+        self.graph = client.Client(
+            url=config.graph_store.config.url,
+            traversal_source=config.graph_store.config.traversal_source,
+            username=config.graph_store.config.username,
+            password=config.graph_store.config.password,
+            message_serializer=config.graph_store.config.message_serializer
+            if config.graph_store.config.message_serializer else serializer.GraphBinarySerializersV1(),
         )
-
-        self.embedding_model = EmbedderFactory.create(
-            self.config.embedder.provider, self.config.embedder.config, self.config.vector_store.config
-        )
-
-        self.node_label = ":`__Entity__`" if self.config.graph_store.config.base_label else ""
-
-
-        if self.config.graph_store.config.base_label:
-            # Safely add user_id index
-            try:
-                self.graph.query(f"CREATE INDEX entity_single IF NOT EXISTS FOR (n {self.node_label}) ON (n.user_id)")
-            except Exception:
-                pass
-            try:  # Safely try to add composite index (Enterprise only)
-                self.graph.query(
-                    f"CREATE INDEX entity_composite IF NOT EXISTS FOR (n {self.node_label}) ON (n.name, n.user_id)"
-                )
-            except Exception:
-                pass
 
         self.llm_provider = "openai_structured"
         if self.config.llm.provider:
             self.llm_provider = self.config.llm.provider
         if self.config.graph_store.llm:
             self.llm_provider = self.config.graph_store.llm.provider
-
         self.llm = LlmFactory.create(self.llm_provider, self.config.llm.config)
-        self.user_id = None
-        self.threshold = 0.7
+
+        self.node_label = "__Entity__" if self.config.graph_store.config.base_label else ""
 
     def add(self, data, filters):
         """
@@ -72,13 +57,12 @@ class MemoryGraph:
             data (str): The data to add to the graph.
             filters (dict): A dictionary containing filters to be applied during the addition.
         """
+        if filters is None or "user_id" not in filters:
+            raise ValueError("filters can't be None and it must contain 'user_id'")
         entity_type_map = self._retrieve_nodes_from_data(data, filters)
         to_be_added = self._establish_nodes_relations_from_data(data, filters, entity_type_map)
         search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
         to_be_deleted = self._get_delete_entities_from_search_output(search_output, data, filters)
-
-        # TODO: Batch queries with APOC plugin
-        # TODO: Add more filter support
         deleted_entities = self._delete_entities(to_be_deleted, filters)
         added_entities = self._add_entities(to_be_added, filters, entity_type_map)
 
@@ -98,6 +82,8 @@ class MemoryGraph:
                 - "contexts": List of search results from the base data store.
                 - "entities": List of related graph data based on the query.
         """
+        if filters is None or "user_id" not in filters:
+            raise ValueError("filters can't be None and it must contain 'user_id'")
         entity_type_map = self._retrieve_nodes_from_data(query, filters)
         search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
 
@@ -121,51 +107,65 @@ class MemoryGraph:
         return search_results
 
     def delete_all(self, filters):
-        if filters.get("agent_id"):
-            cypher = f"""
-            MATCH (n {self.node_label} {{user_id: $user_id, agent_id: $agent_id}})
-            DETACH DELETE n
-            """
-            params = {"user_id": filters["user_id"], "agent_id": filters["agent_id"]}
-        else:
-            cypher = f"""
-            MATCH (n {self.node_label} {{user_id: $user_id}})
-            DETACH DELETE n
-            """
-            params = {"user_id": filters["user_id"]}
-        self.graph.query(cypher, params=params)
+        if filters is None or "user_id" not in filters:
+            raise ValueError("filters can't be None and it must contain 'user_id'")
+
+        user_id = filters["user_id"]
+        agent_id = filters.get("agent_id")
+        query = f"g.V().hasLabel('{self.node_label}').has('user_id', '{user_id}')"
+        if agent_id:
+            query += f".has('agent_id', '{agent_id}')"
+        query += ".sideEffect(__.bothE().drop()).drop()"
+        self.graph.submit(query)
 
     def get_all(self, filters, limit=100):
-        agent_filter = ""
-        params = {"user_id": filters["user_id"], "limit": limit}
-        if filters.get("agent_id"):
-            agent_filter = "AND n.agent_id = $agent_id AND m.agent_id = $agent_id"
-            params["agent_id"] = filters["agent_id"]
+        if filters is None or "user_id" not in filters:
+            raise ValueError("filters can't be None and it must contain 'user_id'")
+        user_id = filters["user_id"]
+        agent_id = filters.get("agent_id")
+        query = (
+            f"g.V().hasLabel(node_label)"
+            f".has('user_id', user_id)"
+        )
+        if agent_id:
+            query += f".has('agent_id', agent_id)"
+        query += (
+            f".outE()"
+            f".where(inV().has('user_id', user_id)"
+        )
+        if agent_id:
+            query += f".has('agent_id', agent_id)"
+        query += (
+            f")"
+            f".project('source', 'relationship', 'target')"
+            f".by(outV().values('name'))"
+            f".by(label)"
+            f".by(inV().values('name'))"
+            f".limit(limit)"
+        )
+        params = {
+            'node_label': self.node_label,
+            'user_id': user_id,
+            'limit': limit
+        }
+        if agent_id:
+            params['agent_id'] = agent_id
 
-        query = f"""
-        MATCH (n {self.node_label} {{user_id: $user_id}})-[r]->(m {self.node_label} {{user_id: $user_id}})
-        WHERE 1=1 {agent_filter}
-        RETURN n.name AS source, type(r) AS relationship, m.name AS target
-        LIMIT $limit
-        """
-        results = self.graph.query(query, params=params)
-
-        final_results = []
-        for result in results:
-            final_results.append(
-                {
-                    "source": result["source"],
-                    "relationship": result["relationship"],
-                    "target": result["target"],
-                }
-            )
-
-        logger.info(f"Retrieved {len(final_results)} relationships")
-
+        results = self.graph.submit(query, params).all().result()
+        final_results = [
+            {
+                "source": result["source"],
+                "relationship": result["relationship"],
+                "target": result["target"]
+            }
+            for result in results
+        ]
         return final_results
 
     def _retrieve_nodes_from_data(self, data, filters):
         """Extracts all the entities mentioned in the query."""
+        if filters is None or "user_id" not in filters:
+            raise ValueError("filters can't be None and it must contain 'user_id'")
         _tools = [EXTRACT_ENTITIES_TOOL]
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [EXTRACT_ENTITIES_STRUCT_TOOL]
@@ -173,7 +173,10 @@ class MemoryGraph:
             messages=[
                 {
                     "role": "system",
-                    "content": f"You are a smart assistant who understands entities and their types in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {filters['user_id']} as the source entity. Extract all the entities from the text. ***DO NOT*** answer the question itself if the given text is a question.",
+                    "content": f"You are a smart assistant who understands entities and their types in a given text. "
+                               f"If user message contains self reference such as 'I', 'me', 'my' etc. "
+                               f"then use {filters['user_id']} as the source entity. Extract all the entities from"
+                               f" the text. ***DO NOT*** answer the question itself if the given text is a question.",
                 },
                 {"role": "user", "content": data},
             ],
@@ -198,9 +201,13 @@ class MemoryGraph:
         return entity_type_map
 
     def _establish_nodes_relations_from_data(self, data, filters, entity_type_map):
-        """Establish relations among the extracted nodes."""
-
+        """
+        Establish relations among the extracted nodes.
+        return List[Dict] stored `source` `destination` `relationship`
+        """
         # Compose user identification string for prompt
+        if filters is None or "user_id" not in filters:
+            raise ValueError("filters can't be None and it must contain 'user_id'")
         user_identity = f"user_id: {filters['user_id']}"
         if filters.get("agent_id"):
             user_identity += f", agent_id: {filters['agent_id']}"
@@ -232,8 +239,8 @@ class MemoryGraph:
         )
 
         entities = []
-        if extracted_entities.get("tool_calls"):
-            entities = extracted_entities["tool_calls"][0].get("arguments", {}).get("entities", [])
+        if extracted_entities["tool_calls"]:
+            entities = extracted_entities["tool_calls"][0]["arguments"]["entities"]
 
         entities = self._remove_spaces_from_entities(entities)
         logger.debug(f"Extracted entities: {entities}")
@@ -241,46 +248,94 @@ class MemoryGraph:
 
     def _search_graph_db(self, node_list, filters, limit=100):
         """Search similar nodes among and their respective incoming and outgoing relations."""
-        result_relations = []
-        agent_filter = ""
+        if filters is None or "user_id" not in filters:
+            raise ValueError("filters can't be None and it must contain 'user_id'")
+        base_query = "g.V().hasLabel(nodeLabel).has('user_id', user_id)"
         if filters.get("agent_id"):
-            agent_filter = "AND n.agent_id = $agent_id AND m.agent_id = $agent_id"
+            base_query += ".where(__.has('agent_id', agent_id))"
 
-        for node in node_list:
-            n_embedding = self.embedding_model.embed(node)
+        outgoing_query = (
+            f"{base_query}"
+            ".as('source')"
+            ".outE().as('relation')"
+            ".inV().has('user_id', user_id)"
+        )
+        if filters.get("agent_id"):
+            outgoing_query += ".where(__.has('agent_id', agent_id))"
+        outgoing_query += (
+            ".as('destination')"
+            ".select('source', 'relation', 'destination')"
+            ".by(project('id', 'name').by(id).by(values('name')))"
+            ".by(project('label', 'id').by(label).by(id))"
+            ".by(project('id', 'name').by(id).by(values('name')))"
+        )
 
-            cypher_query = f"""
-            MATCH (n {self.node_label})
-            WHERE n.embedding IS NOT NULL AND n.user_id = $user_id
-            {agent_filter}
-            WITH n, round(2 * vector.similarity.cosine(n.embedding, $n_embedding) - 1, 4) AS similarity // denormalize for backward compatibility
-            WHERE similarity >= $threshold
-            CALL {{
-                MATCH (n)-[r]->(m)
-                WHERE m.user_id = $user_id {agent_filter.replace("n.", "m.")} 
-                RETURN n.name AS source, elementId(n) AS source_id, type(r) AS relationship, elementId(r) AS relation_id, m.name AS destination, elementId(m) AS destination_id
-                UNION
-                MATCH (m)-[r]->(n)
-                WHERE m.user_id = $user_id {agent_filter.replace("n.", "m.")}
-                RETURN m.name AS source, elementId(m) AS source_id, type(r) AS relationship, elementId(r) AS relation_id, n.name AS destination, elementId(n) AS destination_id
-            }}
-            WITH distinct source, source_id, relationship, relation_id, destination, destination_id, similarity
-            RETURN source, source_id, relationship, relation_id, destination, destination_id, similarity
-            ORDER BY similarity DESC
-            LIMIT $limit
-            """
+        incoming_query = (
+            f"{base_query}"
+            ".as('destination')"
+            ".inE().as('relation')"
+            ".outV().has('user_id', user_id)"
+        )
+        if filters.get("agent_id"):
+            incoming_query += ".where(__.has('agent_id', agent_id))"
+        incoming_query += (
+            ".as('source')"
+            ".select('source', 'relation', 'destination')"
+            ".by(project('id', 'name').by(id).by(values('name')))"
+            ".by(project('label', 'id').by(label).by(id))"
+            ".by(project('id', 'name').by(id).by(values('name')))"
+        )
 
-            params = {
-                "n_embedding": n_embedding,
-                "threshold": self.threshold,
-                "user_id": filters["user_id"],
-                "limit": limit,
+        outgoing_query += ".dedup().limit(limit)"
+        incoming_query += ".dedup().limit(limit)"
+
+        query_params = {
+            'nodeLabel': self.node_label,
+            'user_id': filters['user_id'],
+            'limit': limit
+        }
+
+        if 'agent_id' in filters:
+            query_params['agent_id'] = filters['agent_id']
+
+        outgoing_results = self.graph.submit(outgoing_query, query_params).all().result()
+        incoming_results = self.graph.submit(incoming_query, query_params).all().result()
+
+        all_results = []
+        all_results.extend(outgoing_results)
+        all_results.extend(incoming_results)
+
+        unique_results = set()
+        for r in all_results:
+            source = r['source']
+            relation = r['relation']
+            destination = r['destination']
+
+            result_tuple = (
+                source.get('name', [None]),
+                source.get('id', [None]),
+                relation.get('label', [None]),
+                relation.get('id', [None]),
+                destination.get('name', [None]),
+                destination.get('id', [None])
+            )
+
+            if result_tuple not in unique_results:
+                unique_results.add(result_tuple)
+                if len(unique_results) >= limit:
+                    break
+
+        result_relations = [
+            {
+                'source': r[0],
+                'source_id': r[1],
+                'relationship': r[2],
+                'relation_id': r[3],
+                'destination': r[4],
+                'destination_id': r[5]
             }
-            if filters.get("agent_id"):
-                params["agent_id"] = filters["agent_id"]
-
-            ans = self.graph.query(cypher_query, params=params)
-            result_relations.extend(ans)
+            for r in unique_results
+        ]
 
         return result_relations
 
@@ -320,8 +375,10 @@ class MemoryGraph:
 
     def _delete_entities(self, to_be_deleted, filters):
         """Delete the entities from the graph."""
+        if filters is None or "user_id" not in filters:
+            raise ValueError("filters can't be None and it must contain 'user_id'")
         user_id = filters["user_id"]
-        agent_id = filters.get("agent_id", None)
+        agent_id = filters.get("agent_id")
         results = []
 
         for item in to_be_deleted:
@@ -329,214 +386,155 @@ class MemoryGraph:
             destination = item["destination"]
             relationship = item["relationship"]
 
-            # Build the agent filter for the query
-            agent_filter = ""
-            params = {
-                "source_name": source,
-                "dest_name": destination,
-                "user_id": user_id,
-            }
+            query = (
+                f"g.V().hasLabel(node_label)"
+                f".has('name', source_name)"
+                f".has('user_id', user_id)"
+            )
 
             if agent_id:
-                agent_filter = "AND n.agent_id = $agent_id AND m.agent_id = $agent_id"
-                params["agent_id"] = agent_id
+                query += f".has('agent_id', agent_id)"
 
-            # Delete the specific relationship between nodes
-            cypher = f"""
-            MATCH (n {self.node_label} {{name: $source_name, user_id: $user_id}})
-            -[r:{relationship}]->
-            (m {self.node_label} {{name: $dest_name, user_id: $user_id}})
-            WHERE 1=1 {agent_filter}
-            DELETE r
-            RETURN 
-                n.name AS source,
-                m.name AS target,
-                type(r) AS relationship
-            """
+            query += (
+                f".outE(relationship)"
+                f".where(inV().has('name', dest_name)"
+                f".has('user_id', user_id)"
+            )
 
-            result = self.graph.query(cypher, params=params)
-            results.append(result)
+            if agent_id:
+                query += f".has('agent_id', agent_id)"
+
+            query += (
+                f")"
+                f".project('source', 'target', 'relationship')"
+                f".by(outV().values('name'))"
+                f".by(inV().values('name'))"
+                f".by(label())"
+            )
+
+            params = {
+                'node_label': self.node_label,
+                'source_name': source,
+                'dest_name': destination,
+                'user_id': user_id,
+                'relationship': relationship
+            }
+            if agent_id:
+                params['agent_id'] = agent_id
+
+            result = self.graph.submit(query, params).all().result()
+            results.extend(result)
+
+            delete_edge_query = (
+                f"g.V().hasLabel(node_label)"
+                f".has('name', source_name)"
+                f".has('user_id', user_id)"
+            )
+            if agent_id:
+                delete_edge_query += f".has('agent_id', agent_id)"
+            delete_edge_query += (
+                f".outE(relationship)"
+                f".where(inV().has('name', dest_name)"
+                f".has('user_id', user_id)"
+            )
+            if agent_id:
+                delete_edge_query += f".has('agent_id', agent_id)"
+            delete_edge_query += f").drop()"
+
+            self.graph.submit(delete_edge_query, params)
+
+            delete_orphan_query = (
+                f"g.V().has('name', source_name).has('user_id', user_id).choose("
+                f"__.not(bothE()),"
+                f"__.drop(),"
+                f"__.property('mentions', __.values('mentions').math('_ - 1')));"
+
+                f"g.V().has('name', dest_name).has('user_id', user_id).choose("
+                f"__.not(bothE()),"
+                f"__.drop(),"
+                f"__.property('mentions', __.values('mentions').math('_ - 1')))"
+            )
+            self.graph.submit(delete_orphan_query, params)
 
         return results
 
     def _add_entities(self, to_be_added, filters, entity_type_map):
         """Add the new entities to the graph. Merge the nodes if they already exist."""
+        if filters is None or "user_id" not in filters:
+            raise ValueError("filters can't be None and it must contain 'user_id'")
         user_id = filters["user_id"]
         agent_id = filters.get("agent_id", None)
         results = []
+
         for item in to_be_added:
             # entities
             source = item["source"]
             destination = item["destination"]
             relationship = item["relationship"]
-
             # types
             source_type = entity_type_map.get(source, "__User__")
-            source_label = self.node_label if self.node_label else f":`{source_type}`"
-            source_extra_set = f", source:`{source_type}`" if self.node_label else ""
+            source_type = self.node_label if self.node_label else source_type
             destination_type = entity_type_map.get(destination, "__User__")
-            destination_label = self.node_label if self.node_label else f":`{destination_type}`"
-            destination_extra_set = f", destination:`{destination_type}`" if self.node_label else ""
+            destination_type = self.node_label if self.node_label else destination_type
 
-            # embeddings
-            source_embedding = self.embedding_model.embed(source)
-            dest_embedding = self.embedding_model.embed(destination)
+            source_id = f"{source}_{user_id}"
+            hash_source_id = hashlib.md5(source_id.encode()).hexdigest()
+            source_id = f"{hash_source_id}_{source_id}"
 
-            # search for the nodes with the closest embeddings
-            source_node_search_result = self._search_source_node(source_embedding, filters, threshold=0.9)
-            destination_node_search_result = self._search_destination_node(dest_embedding, filters, threshold=0.9)
+            dest_id = f"{destination}_{user_id}"
+            hash_dest_id = hashlib.md5(dest_id.encode()).hexdigest()
+            dest_id = f"{hash_dest_id}_{dest_id}"
 
-            # TODO: Create a cypher query and common params for all the cases
-            if not destination_node_search_result and source_node_search_result:
-                # Build destination MERGE properties
-                merge_props = ["name: $destination_name", "user_id: $user_id"]
-                if agent_id:
-                    merge_props.append("agent_id: $agent_id")
-                merge_props_str = ", ".join(merge_props)
+            query = f"""
+            g.V('{source_id}').fold()
+            .coalesce(
+                unfold(),
+                addV('{source_type}')
+                    .property(id, '{source_id}')
+                    .property('name', '{source}')
+                    .property('user_id', '{user_id}')
+                    .property('created', {self._current_timestamp()})
+                    {f".property('agent_id', '{agent_id}')" if agent_id else ''}
+            )
+            .property('mentions', coalesce(values('mentions'), constant(0)).math('_ + 1'))
+            .store('a')
+            .V('{dest_id}').fold()
+            .coalesce(
+                unfold(),
+                addV('{destination_type}')
+                    .property(id, '{dest_id}')
+                    .property('name', '{destination}')
+                    .property('user_id', '{user_id}')
+                    .property('created', {self._current_timestamp()})
+                    {f".property('agent_id', '{agent_id}')" if agent_id else ''}
+            )
+            .property('mentions', coalesce(values('mentions'), constant(0)).math('_ + 1'))
+            .as('b')
+            .select('a').unfold()
+            .coalesce(
+                __.outE('{relationship}').where(inV().as('b'))
+                    .property('mentions', coalesce(values('mentions'), constant(0)).math('_ + 1')),
+                addE('{relationship}')
+                    .to('b')
+                    .property('mentions', 1)
+                    .property('created', {self._current_timestamp()})
+            )
+            .outV() 
+            .project('source', 'destination')
+            .by('name')
+            .by(select('b').values('name'))
+            """
 
-                cypher = f"""
-                MATCH (source)
-                WHERE elementId(source) = $source_id
-                SET source.mentions = coalesce(source.mentions, 0) + 1
-                WITH source
-                MERGE (destination {destination_label} {{{merge_props_str}}})
-                ON CREATE SET
-                    destination.created = timestamp(),
-                    destination.mentions = 1
-                    {destination_extra_set}
-                ON MATCH SET
-                    destination.mentions = coalesce(destination.mentions, 0) + 1
-                WITH source, destination
-                CALL db.create.setNodeVectorProperty(destination, 'embedding', $destination_embedding)
-                WITH source, destination
-                MERGE (source)-[r:{relationship}]->(destination)
-                ON CREATE SET 
-                    r.created = timestamp(),
-                    r.mentions = 1
-                ON MATCH SET
-                    r.mentions = coalesce(r.mentions, 0) + 1
-                RETURN source.name AS source, type(r) AS relationship, destination.name AS target
-                """
+            # Execute the query
+            result = self.graph.submit_async(query).result().all().result()
 
-                params = {
-                    "source_id": source_node_search_result[0]["elementId(source_candidate)"],
-                    "destination_name": destination,
-                    "destination_embedding": dest_embedding,
-                    "user_id": user_id,
-                }
-                if agent_id:
-                    params["agent_id"] = agent_id
+            if result:
+                results.append({
+                    "source": result[0]['source'],
+                    "relationship": relationship,
+                    "target": result[0]['destination']
+                })
 
-            elif destination_node_search_result and not source_node_search_result:
-                # Build source MERGE properties
-                merge_props = ["name: $source_name", "user_id: $user_id"]
-                if agent_id:
-                    merge_props.append("agent_id: $agent_id")
-                merge_props_str = ", ".join(merge_props)
-
-                cypher = f"""
-                MATCH (destination)
-                WHERE elementId(destination) = $destination_id
-                SET destination.mentions = coalesce(destination.mentions, 0) + 1
-                WITH destination
-                MERGE (source {source_label} {{{merge_props_str}}})
-                ON CREATE SET
-                    source.created = timestamp(),
-                    source.mentions = 1
-                    {source_extra_set}
-                ON MATCH SET
-                    source.mentions = coalesce(source.mentions, 0) + 1
-                WITH source, destination
-                CALL db.create.setNodeVectorProperty(source, 'embedding', $source_embedding)
-                WITH source, destination
-                MERGE (source)-[r:{relationship}]->(destination)
-                ON CREATE SET 
-                    r.created = timestamp(),
-                    r.mentions = 1
-                ON MATCH SET
-                    r.mentions = coalesce(r.mentions, 0) + 1
-                RETURN source.name AS source, type(r) AS relationship, destination.name AS target
-                """
-
-                params = {
-                    "destination_id": destination_node_search_result[0]["elementId(destination_candidate)"],
-                    "source_name": source,
-                    "source_embedding": source_embedding,
-                    "user_id": user_id,
-                }
-                if agent_id:
-                    params["agent_id"] = agent_id
-
-            elif source_node_search_result and destination_node_search_result:
-                cypher = f"""
-                MATCH (source)
-                WHERE elementId(source) = $source_id
-                SET source.mentions = coalesce(source.mentions, 0) + 1
-                WITH source
-                MATCH (destination)
-                WHERE elementId(destination) = $destination_id
-                SET destination.mentions = coalesce(destination.mentions, 0) + 1
-                MERGE (source)-[r:{relationship}]->(destination)
-                ON CREATE SET 
-                    r.created_at = timestamp(),
-                    r.updated_at = timestamp(),
-                    r.mentions = 1
-                ON MATCH SET r.mentions = coalesce(r.mentions, 0) + 1
-                RETURN source.name AS source, type(r) AS relationship, destination.name AS target
-                """
-
-                params = {
-                    "source_id": source_node_search_result[0]["elementId(source_candidate)"],
-                    "destination_id": destination_node_search_result[0]["elementId(destination_candidate)"],
-                    "user_id": user_id,
-                }
-                if agent_id:
-                    params["agent_id"] = agent_id
-
-            else:
-                # Build dynamic MERGE props for both source and destination
-                source_props = ["name: $source_name", "user_id: $user_id"]
-                dest_props = ["name: $dest_name", "user_id: $user_id"]
-                if agent_id:
-                    source_props.append("agent_id: $agent_id")
-                    dest_props.append("agent_id: $agent_id")
-                source_props_str = ", ".join(source_props)
-                dest_props_str = ", ".join(dest_props)
-
-                cypher = f"""
-                MERGE (source {source_label} {{{source_props_str}}})
-                ON CREATE SET source.created = timestamp(),
-                            source.mentions = 1
-                            {source_extra_set}
-                ON MATCH SET source.mentions = coalesce(source.mentions, 0) + 1
-                WITH source
-                CALL db.create.setNodeVectorProperty(source, 'embedding', $source_embedding)
-                WITH source
-                MERGE (destination {destination_label} {{{dest_props_str}}})
-                ON CREATE SET destination.created = timestamp(),
-                            destination.mentions = 1
-                            {destination_extra_set}
-                ON MATCH SET destination.mentions = coalesce(destination.mentions, 0) + 1
-                WITH source, destination
-                CALL db.create.setNodeVectorProperty(destination, 'embedding', $dest_embedding)
-                WITH source, destination
-                MERGE (source)-[rel:{relationship}]->(destination)
-                ON CREATE SET rel.created = timestamp(), rel.mentions = 1
-                ON MATCH SET rel.mentions = coalesce(rel.mentions, 0) + 1
-                RETURN source.name AS source, type(rel) AS relationship, destination.name AS target
-                """
-
-                params = {
-                    "source_name": source,
-                    "dest_name": destination,
-                    "source_embedding": source_embedding,
-                    "dest_embedding": dest_embedding,
-                    "user_id": user_id,
-                }
-                if agent_id:
-                    params["agent_id"] = agent_id
-            result = self.graph.query(cypher, params=params)
-            results.append(result)
         return results
 
     def _remove_spaces_from_entities(self, entity_list):
@@ -547,68 +545,15 @@ class MemoryGraph:
         return entity_list
 
     def _search_source_node(self, source_embedding, filters, threshold=0.9):
-        agent_filter = ""
-        if filters.get("agent_id"):
-            agent_filter = "AND source_candidate.agent_id = $agent_id"
-
-        cypher = f"""
-            MATCH (source_candidate {self.node_label})
-            WHERE source_candidate.embedding IS NOT NULL 
-            AND source_candidate.user_id = $user_id
-            {agent_filter}
-
-            WITH source_candidate,
-            round(2 * vector.similarity.cosine(source_candidate.embedding, $source_embedding) - 1, 4) AS source_similarity // denormalize for backward compatibility
-            WHERE source_similarity >= $threshold
-
-            WITH source_candidate, source_similarity
-            ORDER BY source_similarity DESC
-            LIMIT 1
-
-            RETURN elementId(source_candidate)
-            """
-
-        params = {
-            "source_embedding": source_embedding,
-            "user_id": filters["user_id"],
-            "threshold": threshold,
-        }
-        if filters.get("agent_id"):
-            params["agent_id"] = filters["agent_id"]
-
-        result = self.graph.query(cypher, params=params)
-        return result
+        raise NotImplementedError("embedding searching is not supported in Gremlin.")
 
     def _search_destination_node(self, destination_embedding, filters, threshold=0.9):
-        agent_filter = ""
-        if filters.get("agent_id"):
-            agent_filter = "AND destination_candidate.agent_id = $agent_id"
+        raise NotImplementedError("embedding searching is not supported in Gremlin.")
 
-        cypher = f"""
-            MATCH (destination_candidate {self.node_label})
-            WHERE destination_candidate.embedding IS NOT NULL 
-            AND destination_candidate.user_id = $user_id
-            {agent_filter}
+    def _current_timestamp(self):
+        return int(time.time())
 
-            WITH destination_candidate,
-            round(2 * vector.similarity.cosine(destination_candidate.embedding, $destination_embedding) - 1, 4) AS destination_similarity // denormalize for backward compatibility
+    def drop_all_entities(self):
+        self.graph.submit('g.E().drop()').all().result()
+        self.graph.submit('g.V().drop()').all().result()
 
-            WHERE destination_similarity >= $threshold
-
-            WITH destination_candidate, destination_similarity
-            ORDER BY destination_similarity DESC
-            LIMIT 1
-
-            RETURN elementId(destination_candidate)
-            """
-
-        params = {
-            "destination_embedding": destination_embedding,
-            "user_id": filters["user_id"],
-            "threshold": threshold,
-        }
-        if filters.get("agent_id"):
-            params["agent_id"] = filters["agent_id"]
-
-        result = self.graph.query(cypher, params=params)
-        return result
