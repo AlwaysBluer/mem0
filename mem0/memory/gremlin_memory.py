@@ -102,8 +102,6 @@ class MemoryGraph:
         for item in reranked_results:
             search_results.append({"source": item[0], "relationship": item[1], "destination": item[2]})
 
-        logger.info(f"Returned {len(search_results)} search results")
-
         return search_results
 
     def delete_all(self, filters):
@@ -439,18 +437,23 @@ class MemoryGraph:
                     delete_edge_query += f".has('agent_id', agent_id)"
                 delete_edge_query += f").drop()"
                 self.graph.submit(delete_edge_query, params)
-                delete_orphan_query = (
-                    f"g.V().has('name', source_name).has('user_id', user_id).choose("
-                    f"__.not(bothE()),"
-                    f"__.drop(),"
-                    f"__.property('mentions', __.values('mentions').math('_ - 1')));"
 
-                    f"g.V().has('name', dest_name).has('user_id', user_id).choose("
-                    f"__.not(bothE()),"
+                source_query = (
+                    f"g.V().has('name', source_name).has('user_id', user_id)"
+                    f".choose(__.not(bothE()),"
                     f"__.drop(),"
                     f"__.property('mentions', __.values('mentions').math('_ - 1')))"
                 )
-                self.graph.submit(delete_orphan_query, params)
+
+                dest_query = (
+                    f"g.V().has('name', dest_name).has('user_id', user_id)"
+                    f".choose(__.not(bothE()),"
+                    f"__.drop(),"
+                    f"__.property('mentions', __.values('mentions').math('_ - 1')))"
+                )
+
+                self.graph.submit_async(source_query).result()
+                self.graph.submit_async(dest_query).result()
         return results
 
     def _add_entities(self, to_be_added, filters, entity_type_map):

@@ -1,4 +1,4 @@
-from typing import Optional, Any
+from typing import Optional, Any, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -63,7 +63,7 @@ class GremlinGraphConfig(BaseModel):
 
 class GraphStoreConfig(BaseModel):
     provider: str = Field(description="Provider of the data store (e.g., 'neo4j')", default="neo4j")
-    config: Any = Field(description="Configuration for the specific data store", default=None)
+    config: Union[Neo4jConfig, MemgraphConfig, GremlinGraphConfig] = Field(description="Configuration for the specific data store", default=None)
     llm: Optional[LlmConfig] = Field(description="LLM configuration for querying the graph store", default=None)
     custom_prompt: Optional[str] = Field(
         description="Custom prompt to fetch entities from the given text", default=None
@@ -76,7 +76,7 @@ class GraphStoreConfig(BaseModel):
             return Neo4jConfig(**v.model_dump())
         elif provider == "memgraph":
             return MemgraphConfig(**v.model_dump())
-        elif provider == "gremlin_graph":
+        elif provider == "gremlin":
             return GremlinGraphConfig(**v.model_dump())
         else:
             raise ValueError(f"Unsupported graph store provider: {provider}")
