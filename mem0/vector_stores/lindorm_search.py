@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -26,10 +27,13 @@ class LindormSearch(VectorStoreBase):
         config = LindormSearchConfig(**kwargs)
 
         # Initialize OpenSearch client
+        auth = config.http_auth
+        if auth is None and config.user and config.password:
+            auth = (config.user, config.password)
+
         self.client = OpenSearch(
             hosts=[{"host": config.host, "port": config.port}],
-            http_auth=config.http_auth if config.http_auth
-            else ((config.user, config.password) if (config.user and config.password) else None),
+            http_auth=auth,
             use_ssl=config.use_ssl,
             verify_certs=config.verify_certs,
             connection_class=RequestsHttpConnection,
@@ -196,7 +200,6 @@ class LindormSearch(VectorStoreBase):
                 for hit in response["hits"]["hits"]
             ]
         except Exception as e:
-            import json
             logger.error(f"Search failed. Query body: {json.dumps(query_body, indent=2)}")
             logger.error(f"Exception: {str(e)}")
             return []
@@ -298,7 +301,7 @@ class LindormSearch(VectorStoreBase):
                     )
                     for hit in hits
             ]
-            return [results]
+            return results
         except Exception as e:
             logger.error(f"Error in list operation: {str(e)}")
             return []

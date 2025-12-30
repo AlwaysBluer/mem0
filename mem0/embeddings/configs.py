@@ -25,7 +25,6 @@ class EmbedderConfig(BaseModel):
             "langchain",
             "aws_bedrock",
             "fastembed",
-            "lindormai",
         ]:
             return v
         else:

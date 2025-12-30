@@ -40,10 +40,6 @@ class BaseEmbedderConfig(ABC):
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
         aws_region: Optional[str] = None,
-        # LindormAI specific
-        lindorm_base_url: Optional[str] = None,
-        lindorm_username: Optional[str] = None,
-        lindorm_password: Optional[str] = None,
     ):
         """
         Initializes a configuration class instance for the Embeddings.
